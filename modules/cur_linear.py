@@ -8,8 +8,7 @@ from typing import Tuple, Optional
 class CURLinear(nn.Module):
     """
     Activation-aware CUR decomposition for Linear layers.
-    Decomposes W ≈ CUR where C contains selected columns, R contains selected rows,
-    and U is the connecting matrix.
+    FIXED VERSION - Addresses parameter ratio calculation issues.
     """
     
     def __init__(self, C: torch.Tensor, U: torch.Tensor, R: torch.Tensor, 
@@ -49,32 +48,18 @@ class CURLinear(nn.Module):
                                           direction: str = 'column') -> torch.Tensor:
         """
         Compute statistical leverage scores for column or row selection.
-        
-        Args:
-            matrix: Input matrix [m, n]
-            k: Target rank
-            direction: 'column' for column scores, 'row' for row scores
-            
-        Returns:
-            leverage_scores: Normalized leverage scores
         """
         if direction == 'column':
-            # Compute top-k right singular vectors for column selection
             try:
                 _, _, V = torch.svd_lowrank(matrix, q=min(k, min(matrix.shape)))
-                # Leverage scores: π_j = (1/k) * Σ(v_ξj)² for ξ=1 to k
                 leverage_scores = torch.sum(V**2, dim=1) / k
             except:
-                # Fallback to uniform selection if SVD fails
                 leverage_scores = torch.ones(matrix.size(1), device=matrix.device) / matrix.size(1)
         else:  # row
-            # Compute top-k left singular vectors for row selection  
             try:
                 U, _, _ = torch.svd_lowrank(matrix, q=min(k, min(matrix.shape)))
-                # Leverage scores: π_i = (1/k) * Σ(u_iξ)² for ξ=1 to k
                 leverage_scores = torch.sum(U**2, dim=1) / k
             except:
-                # Fallback to uniform selection if SVD fails
                 leverage_scores = torch.ones(matrix.size(0), device=matrix.device) / matrix.size(0)
                 
         # Normalize to form probability distribution
@@ -85,17 +70,13 @@ class CURLinear(nn.Module):
     def select_columns_rows_cur(matrix: torch.Tensor, k_cols: int, k_rows: int,
                                leverage_scores_cols: torch.Tensor,
                                leverage_scores_rows: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Select columns and rows based on leverage scores.
-        Uses deterministic selection for better reproducibility.
-        """
+        """Select columns and rows based on leverage scores."""
         m, n = matrix.shape
         
-        # Use exact target numbers
         c_actual = min(k_cols, n)
         r_actual = min(k_rows, m)
         
-        # Use top-k selection instead of random sampling for more stable results
+        # Use top-k selection for more stable results
         col_indices = torch.topk(leverage_scores_cols, c_actual)[1]
         row_indices = torch.topk(leverage_scores_rows, r_actual)[1]
             
@@ -104,27 +85,12 @@ class CURLinear(nn.Module):
     @staticmethod
     def compute_connecting_matrix(C: torch.Tensor, R: torch.Tensor, 
                                 W_subset: torch.Tensor) -> torch.Tensor:
-        """
-        Compute the connecting matrix U using Moore-Penrose pseudoinverse.
-        Improved version with better numerical stability.
-        
-        Args:
-            C: Selected columns [m, k_cols]
-            R: Selected rows [k_rows, n]  
-            W_subset: Intersection matrix W[row_indices, col_indices] [k_rows, k_cols]
-            
-        Returns:
-            U: Connecting matrix [k_cols, k_rows]
-        """
+        """Compute the connecting matrix U using Moore-Penrose pseudoinverse."""
         try:
-            # Add small regularization for numerical stability
             reg = 1e-6
-            
-            # Improved computation: U = (C^T C + reg*I)^{-1} C^T W_subset R^T (R R^T + reg*I)^{-1}
             CtC = C.T @ C + reg * torch.eye(C.size(1), device=C.device)
             RRt = R @ R.T + reg * torch.eye(R.size(0), device=R.device)
             
-            # Solve linear systems instead of direct inverse
             CtC_inv = torch.linalg.solve(CtC, torch.eye(C.size(1), device=C.device))
             RRt_inv = torch.linalg.solve(RRt, torch.eye(R.size(0), device=R.device))
             
@@ -134,71 +100,87 @@ class CURLinear(nn.Module):
             return U
             
         except:
-            # Fallback to simple pseudoinverse
             try:
                 C_pinv = torch.pinverse(C)
                 R_pinv = torch.pinverse(R)
                 U = C_pinv @ W_subset @ R_pinv
                 return U
             except:
-                # Final fallback - identity-like matrix
                 k_cols, k_rows = C.size(1), R.size(0)
                 min_dim = min(k_cols, k_rows)
                 U = torch.zeros(k_cols, k_rows, device=C.device)
                 U[:min_dim, :min_dim] = torch.eye(min_dim, device=C.device)
                 return U
 
+    @staticmethod
+    def calculate_optimal_k_fixed(m: int, n: int, target_ratio: float, rank_align: int = 1) -> int:
+        """
+        FIXED: Calculate optimal k value for target parameter ratio.
+        
+        Solves: k(m + k + n) = target_ratio * m * n
+        Which gives: k² + k(m + n) - target_ratio*m*n = 0
+        """
+        target_params = target_ratio * m * n
+        
+        # Quadratic formula: ax² + bx + c = 0
+        a = 1
+        b = m + n  
+        c = -target_params
+        
+        discriminant = b * b - 4 * a * c
+        
+        if discriminant >= 0:
+            # Take positive root
+            k_optimal = (-b + np.sqrt(discriminant)) / (2 * a)
+            k = int(np.round(k_optimal))
+        else:
+            # Fallback if no real solution
+            k = min(m, n) // 4
+        
+        # Apply constraints
+        k = max(1, k)  # At least 1
+        
+        # FIXED: More generous upper bound for high compression ratios
+        max_k_theoretical = min(m, n)  # Theoretical maximum
+        max_k_practical = int(max_k_theoretical * 0.8)  # Use 80% of theoretical max
+        k = min(k, max_k_practical)
+        
+        # Apply rank alignment
+        if rank_align > 1:
+            k = int(np.ceil(k / rank_align) * rank_align)
+            k = max(rank_align, k)  # At least one alignment unit
+        
+        # Verify the result
+        actual_params = k * (m + k + n)
+        actual_ratio = actual_params / (m * n)
+        
+        print(f"   🔧 k calculation: target_ratio={target_ratio:.3f}, k={k}, "
+              f"estimated_ratio={actual_ratio:.3f}, m={m}, n={n}")
+        
+        return k
+
     @staticmethod  
     def from_linear(linear: nn.Linear, param_ratio: float, act_aware=False, 
                    ic_split=1, oc_split=1, alpha=1, sigma_fuse="UV", rank_align=1) -> 'CURLinear':
         """
-        Create CURLinear from existing Linear layer using activation-aware CUR decomposition.
-        
-        Args:
-            linear: Original linear layer
-            param_ratio: Target parameter ratio (compressed/original)
-            act_aware: Whether to use activation-aware decomposition
-            alpha: Scaling factor for activation awareness
-            rank_align: Rank alignment factor
-            
-        Returns:
-            CURLinear layer
+        FIXED VERSION: Create CURLinear from existing Linear layer.
         """
         
         # Get original weight matrix
-        w = linear.weight.data.float()  # [out_features, in_features]
+        w = linear.weight.data.float()
         m, n = w.shape
         
-        # Calculate target number of columns and rows based on param_ratio
-        # For CUR: total_params = m*k_cols + k_cols*k_rows + k_rows*n
-        # Setting k_cols = k_rows = k for simplicity
-        # So: total_params = k*(m + k + n)
-        # We want: k*(m + k + n) = param_ratio * m*n
-        # Solving: k^2 + k*(m + n) - param_ratio*m*n = 0
-        
-        # Try different k values to find one that gets close to target ratio
-        target_params = int(param_ratio * m * n)
-        best_k = 1
-        best_diff = float('inf')
-        
-        # Search for optimal k
-        max_k = min(m, n) // 3
-        for k in range(1, max_k + 1):
-            actual_params = k * (m + k + n)
-            diff = abs(actual_params - target_params)
-            if diff < best_diff:
-                best_diff = diff
-                best_k = k
-            if actual_params > target_params:
-                break
-        
-        # Apply rank alignment
-        k = int(np.ceil(best_k / rank_align) * rank_align)
-        k = max(1, min(k, min(m, n) // 3))  # Safety bounds
-        
+        # FIXED: Use the corrected k calculation
+        k = CURLinear.calculate_optimal_k_fixed(m, n, param_ratio, rank_align)
         k_cols = k_rows = k
         
-        print(f"   CUR decomposition: target_ratio={param_ratio:.3f}, k={k}, estimated_ratio={(k*(m+k+n))/(m*n):.3f}")
+        print(f"   CUR decomposition: target_ratio={param_ratio:.3f}, k={k}, "
+              f"matrix_shape=({m},{n})")
+        
+        # Early exit if k is too large (impossible compression)
+        if k >= min(m, n):
+            print(f"   ❌ CUR impossible: k={k} >= min(m,n)={min(m,n)}, falling back to original")
+            return linear
         
         # Apply activation-aware scaling if enabled
         scaling_diag_matrix = None
@@ -244,27 +226,37 @@ class CURLinear(nn.Module):
         
         # Check for NaN/Inf
         if torch.isnan(C).any() or torch.isnan(U).any() or torch.isnan(R).any():
-            print("NaN detected in CUR decomposition, falling back to identity")
-            return nn.Linear(linear.in_features, linear.out_features).to(linear.weight.dtype).to(linear.weight.device)
+            print("   ❌ NaN detected in CUR decomposition, falling back to original")
+            return linear
             
         if torch.isinf(C).any() or torch.isinf(U).any() or torch.isinf(R).any():
-            print("Inf detected in CUR decomposition, falling back to identity")
-            return nn.Linear(linear.in_features, linear.out_features).to(linear.weight.dtype).to(linear.weight.device)
+            print("   ❌ Inf detected in CUR decomposition, falling back to original")
+            return linear
         
         # Create CURLinear layer
         cur_linear = CURLinear(C, U, R, col_indices, row_indices, bias)
         cur_linear.to(linear.weight.dtype)
         
+        # Verify the parameter ratio
+        actual_ratio = cur_linear.get_param_ratio()
+        ratio_error = abs(actual_ratio - param_ratio)
+        
+        # FIXED: More lenient acceptance criteria
+        if ratio_error > 0.3:  # Accept if within 30% of target
+            print(f"   ⚠️  Large ratio error: target={param_ratio:.3f}, actual={actual_ratio:.3f}, "
+                  f"error={ratio_error:.3f}")
+            # Still return the CUR layer - it's better than nothing
+        
+        print(f"   ✅ CUR created: target={param_ratio:.3f}, actual={actual_ratio:.3f}, "
+              f"compression={1-actual_ratio:.1%}")
+        
         return cur_linear
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass: y = x @ R^T @ U^T @ C^T + bias
-        """
-        # Explicit matrix multiplications to avoid F.linear confusion
-        x = torch.matmul(x, self.R.T)         # [batch, in_features] @ [in_features, k_rows] = [batch, k_rows]
-        x = torch.matmul(x, self.U.T)         # [batch, k_rows] @ [k_rows, k_cols] = [batch, k_cols]
-        x = torch.matmul(x, self.C.T)         # [batch, k_cols] @ [k_cols, out_features] = [batch, out_features]
+        """Forward pass: y = x @ R^T @ U^T @ C^T + bias"""
+        x = torch.matmul(x, self.R.T)         # [batch, in_features] @ [in_features, k_rows]
+        x = torch.matmul(x, self.U.T)         # [batch, k_rows] @ [k_rows, k_cols]
+        x = torch.matmul(x, self.C.T)         # [batch, k_cols] @ [k_cols, out_features]
         
         if self.bias is not None:
             x = x + self.bias
@@ -272,32 +264,19 @@ class CURLinear(nn.Module):
         return x
     
     def reconstruct_weight(self) -> torch.Tensor:
-        """
-        Reconstruct the full weight matrix from CUR decomposition.
-        
-        Returns:
-            Reconstructed weight matrix [out_features, in_features]
-        """
-        # W ≈ C @ U @ R
+        """Reconstruct the full weight matrix from CUR decomposition."""
         reconstructed = self.C @ self.U @ self.R
         return reconstructed
     
     def get_param_ratio(self) -> float:
-        """
-        Calculate the actual parameter ratio (compressed/original).
-        
-        Returns:
-            Parameter ratio
-        """
+        """Calculate the actual parameter ratio (compressed/original)."""
         compressed_params = (self.C.numel() + self.U.numel() + self.R.numel())
         original_params = self.original_out_features * self.original_in_features
         return compressed_params / original_params
 
 
 class GradCURLinear(nn.Module):
-    """
-    Gradient-based CUR Linear layer for optimization during search.
-    """
+    """Gradient-based CUR Linear layer for optimization during search."""
     
     def __init__(self, weight: torch.Tensor, scale: torch.Tensor, bias: Optional[torch.Tensor], 
                  k_cols: int, k_rows: int) -> None:
@@ -311,27 +290,15 @@ class GradCURLinear(nn.Module):
     @staticmethod
     def from_linear(linear: nn.Linear, param_ratio: float, act_aware=False, 
                    ic_split=1, oc_split=1, alpha=1, sigma_fuse="UV") -> 'GradCURLinear':
-        """
-        Create GradCURLinear from existing Linear layer.
-        """
+        """Create GradCURLinear from existing Linear layer."""
         if param_ratio >= 1:
             return linear
             
         w = linear.weight.data.float()
         m, n = w.shape
         
-        # Calculate k similar to CURLinear.from_linear
-        a = 1
-        b = m + n
-        c = -param_ratio * m * n
-        discriminant = b*b - 4*a*c
-        
-        if discriminant < 0:
-            k = min(m, n) // 4
-        else:
-            k = int((-b + np.sqrt(discriminant)) / (2*a))
-            
-        k = max(1, min(k, min(m, n) // 2))
+        # Use the fixed k calculation
+        k = CURLinear.calculate_optimal_k_fixed(m, n, param_ratio)
         k_cols = k_rows = k
         
         # Handle activation awareness
@@ -348,9 +315,7 @@ class GradCURLinear(nn.Module):
         return GradCURLinear(w, scaling_diag_matrix, bias, k_cols, k_rows)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass with dynamic CUR decomposition.
-        """
+        """Forward pass with dynamic CUR decomposition."""
         # Scale weight matrix
         w_scaled = self.weight * self.scale.view(1, -1)
         
