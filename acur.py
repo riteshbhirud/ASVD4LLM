@@ -12,7 +12,7 @@ import numpy as np
 
 
 def main(args):
-    # setting random seed of numpy and torch
+    # Setting random seed of numpy and torch
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
@@ -26,10 +26,8 @@ def main(args):
         model_id, device_map="auto", torch_dtype=torch.float16, trust_remote_code=True
     )
 
-    # if "llama" in model_id or "opt" in model_id:
-    #     model = model.to_bettertransformer()
     if not args.raw_model:
-        # sensitivity calibration
+        # Sensitivity calibration
         calib_loader = get_calib_data(
             args.calib_dataset, tokenizer, model_id, args.n_calib_samples, seed=args.seed, use_bos=args.use_bos
         )
@@ -42,11 +40,10 @@ def main(args):
         elif args.sensitivity_metric == "stable_rank":
             sensitivity = calib_sensitivity_stable_rank(model, calib_loader, args, args.use_cache)
 
-        # search best truncation rank for each layer
-
+        # Search best truncation rank for each layer
         binary_search_truncation_rank(model, sensitivity, calib_loader, args)
 
-        # quantization
+        # Quantization
         if args.weight_quant != "none":
             if args.weight_quant == "rtn_int8":
                 rtn_quant_sequential(model, 8)
@@ -57,7 +54,7 @@ def main(args):
             elif args.weight_quant == "awq_int4":
                 model = awq_quant_sequential(model, tokenizer, 4)
 
-    # evaluate
+    # Evaluate
     result = evaluate_model(
         model,
         tokenizer,
@@ -73,8 +70,6 @@ def main(args):
     with open("output/result.txt", "a+") as f:
         f.write(f"{args}\n")
         f.write(f"{result}\n")
-
-    # finished
 
 
 if __name__ == "__main__":
@@ -100,13 +95,13 @@ if __name__ == "__main__":
     parser.add_argument(
         "--act_aware",
         action="store_true",
-        help="use act aware svd (ASVD)",
+        help="use act aware cur (ACUR)",
     )
     parser.add_argument(
         "--alpha",
         type=float,
         default=0.5,
-        help="hyper-parameter alpha for ASVD",
+        help="hyper-parameter alpha for ACUR",
     )
     parser.add_argument(
         "--n_calib_samples",
@@ -162,7 +157,7 @@ if __name__ == "__main__":
         "--sigma_fuse",
         type=str,
         default="UV",
-        help="sigma fuse method",
+        help="sigma fuse method (kept for compatibility)",
         choices=["U", "V", "UV"],
     )
     parser.add_argument(
@@ -173,8 +168,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--compress_kv_cache",
-        action="store_true",
-        help="compress kv cache by asvd for k_proj and v_proj",
+        action="store_true", 
+        help="compress kv cache by acur for k_proj and v_proj",
     )
     parser.add_argument(
         "--kv_cache_ratio_target",
@@ -186,12 +181,12 @@ if __name__ == "__main__":
         "--rank_align",
         type=int,
         default=1,
-        help="align rank in SVD",
+        help="align rank in CUR",
     )
     parser.add_argument(
         "--raw_model",
         action="store_true",
-        help="use the raw model without ASVD",
+        help="use the raw model without ACUR",
     )
     parser.add_argument(
         "--use_bos",

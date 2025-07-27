@@ -9,7 +9,7 @@ import transformers
 import numpy as np
 import torch
 import torch.nn as nn
-from modules.svd_linear import SVDLinear
+from modules.cur_linear import CURLinear
 
 DEBUG = False
 
@@ -155,22 +155,47 @@ def find_layers(module, layers=[nn.Conv2d, nn.Linear], name=""):
 
 @torch.no_grad()
 def rtn_quant_sequential(model, wbits):
-    print("Starting ...")
+    print("Starting RTN quantization for CUR components...")
 
     if "opt" in model.config._name_or_path:
         layers = model.model.decoder.layers
     elif "llama" in model.config._name_or_path:
         layers = model.model.layers
+    
     for i in range(len(layers)):
         layer = layers[i].to(model.device)
         subset = find_layers(layer)
         for name in subset:
-            quantizer = Quantizer()
-            quantizer.configure(wbits, perchannel=True, sym=False, mse=False)
-            quantizer.find_params(subset[name].weight.data.float(), weight=True)
-            wq = quantizer.quantize(subset[name].weight.data.float())
-            subset[name].weight.data = wq.to(subset[name].weight.data.dtype)
-            print(f"Quantizing {name} finished")
+            module = subset[name]
+            if isinstance(module, CURLinear):
+                # Quantize each CUR component separately
+                # C component
+                quantizer_C = Quantizer()
+                quantizer_C.configure(wbits, perchannel=True, sym=False, mse=False)
+                quantizer_C.find_params(module.C.data.float(), weight=True)
+                module.C.data = quantizer_C.quantize(module.C.data.float()).to(module.C.data.dtype)
+                
+                # U component  
+                quantizer_U = Quantizer()
+                quantizer_U.configure(wbits, perchannel=True, sym=False, mse=False)
+                quantizer_U.find_params(module.U.data.float(), weight=True)
+                module.U.data = quantizer_U.quantize(module.U.data.float()).to(module.U.data.dtype)
+                
+                # R component
+                quantizer_R = Quantizer()
+                quantizer_R.configure(wbits, perchannel=True, sym=False, mse=False)
+                quantizer_R.find_params(module.R.data.float(), weight=True)
+                module.R.data = quantizer_R.quantize(module.R.data.float()).to(module.R.data.dtype)
+                
+                print(f"Quantizing CUR components in {name} finished")
+            else:
+                # Standard linear layer quantization
+                quantizer = Quantizer()
+                quantizer.configure(wbits, perchannel=True, sym=False, mse=False)
+                quantizer.find_params(module.weight.data.float(), weight=True)
+                wq = quantizer.quantize(module.weight.data.float())
+                module.weight.data = wq.to(module.weight.data.dtype)
+                print(f"Quantizing {name} finished")
         del layer
         torch.cuda.empty_cache()
 
@@ -180,44 +205,41 @@ def awq_quant_sequential(model, tokenizer, wbits):
 
     device = model.device
 
-    class ASVDLlamaAWQForCausalLM(LlamaAWQForCausalLM):
+    class ACURLlamaAWQForCausalLM(LlamaAWQForCausalLM):
         @staticmethod
         def get_layers_for_scaling(module, input_feat, module_kwargs):
             layers = []
-            # breakpoint()
             input_names = []
 
-            def svdlinear_process(module, inp_name, module2inspect=None, kwargs=None):
+            def curlinear_process(module, inp_name, module2inspect=None, kwargs=None):
                 module2inspect = None
                 kwargs = {}
-                if isinstance(module, SVDLinear):
+                if isinstance(module, CURLinear):
+                    # For CUR, we need to handle the decomposed structure
+                    # We'll treat it as multiple linear operations: R -> U -> C
                     layers.append(
                         dict(
-                            prev_op=module.BLinear,
-                            layers=[module.ALinear],
-                            inp=input_feat[inp_name + ".ALinear"],
+                            prev_op=module.R,  # First operation in the chain
+                            layers=[module.C],  # Final operation
+                            inp=input_feat[inp_name + ".C"],
                             module2inspect=module2inspect,
                             kwargs=kwargs,
                         )
                     )
-                    input_names.append(inp_name + ".BLinear")
-                    return module.BLinear
-
+                    input_names.append(inp_name + ".R")
+                    return module.R
                 else:
                     input_names.append(inp_name)
                     return module
 
-            # attention input
+            # Attention input
             layers.append(
                 dict(
                     prev_op=module.input_layernorm,
                     layers=[
-                        # svdlinear_process(module.self_attn.k_proj, "self_attn.k_proj", module.self_attn, module_kwargs),
-                        # svdlinear_process(module.self_attn.q_proj, "self_attn.q_proj", module.self_attn, module_kwargs),
-                        # svdlinear_process(module.self_attn.v_proj, "self_attn.v_proj", module.self_attn, module_kwargs),
-                        svdlinear_process(module.self_attn.k_proj, "self_attn.k_proj", module.self_attn, module_kwargs),
-                        svdlinear_process(module.self_attn.q_proj, "self_attn.q_proj", module.self_attn, module_kwargs),
-                        svdlinear_process(module.self_attn.v_proj, "self_attn.v_proj", module.self_attn, module_kwargs),
+                        curlinear_process(module.self_attn.k_proj, "self_attn.k_proj", module.self_attn, module_kwargs),
+                        curlinear_process(module.self_attn.q_proj, "self_attn.q_proj", module.self_attn, module_kwargs),
+                        curlinear_process(module.self_attn.v_proj, "self_attn.v_proj", module.self_attn, module_kwargs),
                     ],
                     inp=input_feat[input_names[-1]],
                     module2inspect=module.self_attn,
@@ -225,41 +247,39 @@ def awq_quant_sequential(model, tokenizer, wbits):
                 )
             )
 
-            # attention out
-            # Please refer to https://github.com/mit-han-lab/llm-awq/pull/67#issue-1850622696
-            # if module.self_attn.v_proj.weight.shape == module.self_attn.o_proj.weight.shape:
+            # Attention out
             layers.append(
                 dict(
                     prev_op=(
-                        module.self_attn.v_proj.ALinear
-                        if isinstance(module.self_attn.v_proj, SVDLinear)
+                        module.self_attn.v_proj.C
+                        if isinstance(module.self_attn.v_proj, CURLinear)
                         else module.self_attn.v_proj
                     ),
-                    layers=[svdlinear_process(module.self_attn.o_proj, "self_attn.o_proj")],
+                    layers=[curlinear_process(module.self_attn.o_proj, "self_attn.o_proj")],
                     inp=input_feat[input_names[-1]],
                 )
             )
 
-            # linear 1
+            # Linear 1
             layers.append(
                 dict(
                     prev_op=module.post_attention_layernorm,
                     layers=[
-                        svdlinear_process(module.mlp.gate_proj, "mlp.gate_proj", module.mlp),
-                        svdlinear_process(module.mlp.up_proj, "mlp.up_proj", module.mlp),
+                        curlinear_process(module.mlp.gate_proj, "mlp.gate_proj", module.mlp),
+                        curlinear_process(module.mlp.up_proj, "mlp.up_proj", module.mlp),
                     ],
                     inp=input_feat[input_names[-1]],
                     module2inspect=module.mlp,
                 )
             )
 
-            # linear 2
+            # Linear 2
             layers.append(
                 dict(
                     prev_op=(
-                        module.mlp.up_proj.ALinear if isinstance(module.mlp.up_proj, SVDLinear) else module.mlp.up_proj
+                        module.mlp.up_proj.C if isinstance(module.mlp.up_proj, CURLinear) else module.mlp.up_proj
                     ),
-                    layers=[svdlinear_process(module.mlp.down_proj, "mlp.down_proj")],
+                    layers=[curlinear_process(module.mlp.down_proj, "mlp.down_proj")],
                     inp=input_feat[input_names[-1]],
                 )
             )
@@ -269,7 +289,7 @@ def awq_quant_sequential(model, tokenizer, wbits):
     quant_config = {"zero_point": True, "q_group_size": 128, "w_bit": wbits, "version": "GEMM"}
 
     # Load model
-    qmodel = ASVDLlamaAWQForCausalLM(model, "llama", False, model.config, quant_config, None)
+    qmodel = ACURLlamaAWQForCausalLM(model, "llama", False, model.config, quant_config, None)
 
     # Quantize
     qmodel.quantize(tokenizer, quant_config=quant_config)
